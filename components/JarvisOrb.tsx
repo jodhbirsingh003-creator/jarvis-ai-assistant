@@ -3,13 +3,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createOrbScene, type OrbSceneApi } from "@/lib/orbScene";
 import { HandTracker, type TrackerStatus } from "@/lib/handTracker";
+import {
+  VoiceInput,
+  speak,
+  stopSpeaking,
+  warmVoices,
+  isSpeechRecognitionSupported,
+  isSpeechSynthesisSupported,
+} from "@/lib/speech";
 
 type CameraState = "off" | "starting" | "on" | "error";
+type VoiceState = "idle" | "listening" | "thinking" | "speaking" | "error";
+
+interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
 
 const MODE_LABEL: Record<TrackerStatus["mode"], string> = {
   idle: "STANDBY",
   spin: "SPIN",
   zoom: "ZOOM",
+};
+
+const VOICE_LABEL: Record<VoiceState, string> = {
+  idle: "TALK",
+  listening: "LISTENING…",
+  thinking: "THINKING…",
+  speaking: "SPEAKING…",
+  error: "VOICE ERROR",
 };
 
 export default function JarvisOrb() {
@@ -23,14 +45,25 @@ export default function JarvisOrb() {
   const [status, setStatus] = useState<TrackerStatus>({ hands: 0, mode: "idle" });
   const [error, setError] = useState<string | null>(null);
 
+  const voiceRef = useRef<VoiceInput | null>(null);
+  const historyRef = useRef<ChatTurn[]>([]);
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState("");
+  const [caption, setCaption] = useState("");
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     const scene = createOrbScene(container);
     sceneRef.current = scene;
+    warmVoices();
     return () => {
       trackerRef.current?.stop();
       trackerRef.current = null;
+      voiceRef.current?.abort();
+      voiceRef.current = null;
+      stopSpeaking();
       scene.dispose();
       sceneRef.current = null;
     };
@@ -78,6 +111,91 @@ export default function JarvisOrb() {
     else void startGestures();
   }, [startGestures, stopGestures]);
 
+  const sendToJarvis = useCallback(async (text: string) => {
+    setVoiceState("thinking");
+    setVoiceError(null);
+    setCaption(`YOU: ${text}`);
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, history: historyRef.current }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const reply: string = data.reply ?? "";
+
+      const userTurn: ChatTurn = { role: "user", content: text };
+      const assistantTurn: ChatTurn = { role: "assistant", content: reply };
+      historyRef.current = [...historyRef.current, userTurn, assistantTurn].slice(-10);
+
+      setCaption(`JARVIS: ${reply}`);
+      setVoiceState("speaking");
+      speak(reply, {
+        onEnd: () => setVoiceState((s) => (s === "speaking" ? "idle" : s)),
+        onError: () => setVoiceState((s) => (s === "speaking" ? "idle" : s)),
+      });
+    } catch (err) {
+      setVoiceState("error");
+      setVoiceError(err instanceof Error ? err.message.toUpperCase() : "REQUEST FAILED");
+    }
+  }, []);
+
+  const startListening = useCallback(() => {
+    if (!isSpeechRecognitionSupported()) {
+      setVoiceState("error");
+      setVoiceError("SPEECH RECOGNITION NOT SUPPORTED (TRY CHROME OR EDGE)");
+      return;
+    }
+    stopSpeaking();
+    setVoiceError(null);
+    setTranscript("");
+    setCaption("");
+    setVoiceState("listening");
+
+    const voice = new VoiceInput({
+      onInterim: (text) => setTranscript(text),
+      onFinal: (text) => {
+        setTranscript("");
+        void sendToJarvis(text);
+      },
+      onError: (err) => {
+        if (err === "no-speech" || err === "aborted") {
+          setVoiceState("idle");
+          return;
+        }
+        setVoiceState("error");
+        setVoiceError(
+          err === "not-allowed" || err === "permission-denied"
+            ? "MICROPHONE ACCESS DENIED"
+            : err === "unsupported"
+              ? "SPEECH RECOGNITION NOT SUPPORTED"
+              : `MIC ERROR: ${err.toUpperCase()}`,
+        );
+      },
+      onEnd: () => {
+        voiceRef.current = null;
+        setVoiceState((s) => (s === "listening" ? "idle" : s));
+      },
+    });
+    voiceRef.current = voice;
+    voice.start();
+  }, [sendToJarvis]);
+
+  const toggleVoice = useCallback(() => {
+    if (voiceState === "listening") {
+      voiceRef.current?.stop();
+      return;
+    }
+    if (voiceState === "speaking") {
+      stopSpeaking();
+      setVoiceState("idle");
+      return;
+    }
+    if (voiceState === "thinking") return;
+    startListening();
+  }, [voiceState, startListening]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       switch (e.key) {
@@ -97,13 +215,24 @@ export default function JarvisOrb() {
         case "G":
           toggleGestures();
           break;
+        case "v":
+        case "V":
+          toggleVoice();
+          break;
+        case "Escape":
+          stopSpeaking();
+          voiceRef.current?.stop();
+          setVoiceState("idle");
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [toggleGestures]);
+  }, [toggleGestures, toggleVoice]);
 
   const cameraOn = camera === "on";
+  const voiceActive = voiceState !== "idle";
+  const captionText = transcript ? `YOU: ${transcript}` : caption;
 
   return (
     <>
@@ -128,11 +257,19 @@ export default function JarvisOrb() {
         ) : (
           <div>
             <span className="key">G</span> hand gestures&nbsp;&nbsp;
+            <span className="key">V</span> talk&nbsp;&nbsp;
             <span className="key">R</span> reset&nbsp;&nbsp;
             <span className="key">+/−</span> zoom
           </div>
         )}
       </div>
+
+      {captionText && (
+        <div className="hud hud-caption">
+          <span className={`caption-badge caption-${voiceState}`}>{VOICE_LABEL[voiceState]}</span>
+          {captionText}
+        </div>
+      )}
 
       <div className="hud hud-controls">
         <div className={`camera-panel${cameraOn ? " visible" : ""}`}>
@@ -147,7 +284,24 @@ export default function JarvisOrb() {
         </div>
 
         {error && <div className="hud-error">{error}</div>}
+        {voiceError && <div className="hud-error">{voiceError}</div>}
 
+        <div className="hud-row">
+          <button
+            type="button"
+            className={`hud-btn${voiceState === "speaking" ? " pulsing" : ""}`}
+            aria-pressed={voiceActive}
+            onClick={toggleVoice}
+            disabled={voiceState === "thinking"}
+            title={
+              isSpeechRecognitionSupported() && isSpeechSynthesisSupported()
+                ? undefined
+                : "Voice needs Chrome or Edge"
+            }
+          >
+            {VOICE_LABEL[voiceState]}
+          </button>
+        </div>
         <div className="hud-row">
           <button
             type="button"
