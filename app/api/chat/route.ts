@@ -9,7 +9,11 @@ const SYSTEM_PROMPT = `You are JARVIS, a sharp, dry-witted AI assistant inspired
 assistant. You are speaking out loud through text-to-speech, so:
 - Keep replies short and conversational (1-3 sentences unless asked for detail).
 - Never use markdown, bullet points, code blocks, or emoji — plain spoken sentences only.
-- Be helpful and direct, with a touch of understated wit.`;
+- Be helpful and direct, with a touch of understated wit.
+- You have a web search tool. Use it whenever the answer depends on current events, prices,
+  scores, weather, or anything else that could have changed since your training — don't guess
+  or rely on stale memory for time-sensitive facts. Summarize what you find in your own words;
+  don't read out URLs.`;
 
 interface ChatTurn {
   role: "user" | "assistant";
@@ -41,8 +45,12 @@ export async function POST(req: NextRequest) {
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-5",
-      max_tokens: 300,
+      max_tokens: 500,
       system: SYSTEM_PROMPT,
+      // Anthropic's server-side web search tool: Claude decides when to use it
+      // (e.g. "what's the news today", "what's the weather"), runs the search
+      // itself, and reasons over the results before replying.
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
       messages: [...history, { role: "user", content: message }],
     });
 
